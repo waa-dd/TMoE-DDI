@@ -51,15 +51,18 @@ class TMoEDDI(nn.Module):
         self.align_x2 = nn.Linear(hidden2, hidden2)
         self.align_x3 = nn.Linear(hidden2, hidden2)
 
-        expert_input_dim = (hidden2 + self.molecular_features.shape[1]) * 2 + (2 * hidden2)
+        expert_input_dim = (hidden2 + self.molecular_features.shape[1]) * 2
+        gate_input_dim = expert_input_dim + (2 * hidden2)
+
         self.classifier1 = ExpertClassifier(expert_input_dim, num_relations, hidden_ratio=1.0)
         self.classifier2 = ExpertClassifier(expert_input_dim, num_relations, hidden_ratio=1.0)
         self.classifier3 = ExpertClassifier(expert_input_dim, num_relations, hidden_ratio=1.0)
 
+        self.gate_input_dim = gate_input_dim
+
     def init_gate_layer(self):
-        gate_input_dim = (self.hidden2 + self.molecular_features.shape[1]) * 2 + (2 * self.hidden2)
         self.gate_layer = nn.Sequential(
-            nn.Linear(gate_input_dim, self.hidden2),
+            nn.Linear(self.gate_input_dim, self.hidden2),
             nn.LayerNorm(self.hidden2),
             nn.ReLU(),
             nn.Dropout(p=self.dropout),
@@ -70,7 +73,11 @@ class TMoEDDI(nn.Module):
         self.gate_layer.to(next(self.parameters()).device)
 
     @staticmethod
-    def _interaction_features(graph_head, graph_tail, mol_head, mol_tail):
+    def _expert_features(graph_head, graph_tail, mol_head, mol_tail):
+        return torch.cat((graph_head, mol_head, graph_tail, mol_tail), dim=1)
+
+    @staticmethod
+    def _gate_features(graph_head, graph_tail, mol_head, mol_tail):
         base = torch.cat((graph_head, mol_head, graph_tail, mol_tail), dim=1)
         return torch.cat((base, torch.abs(graph_head - graph_tail), graph_head * graph_tail), dim=1)
 
@@ -93,9 +100,9 @@ class TMoEDDI(nn.Module):
         mol_a = self.molecular_features[drug_a]
         mol_b = self.molecular_features[drug_b]
 
-        e1_input = self._interaction_features(expert1[drug_a], expert1[drug_b], mol_a, mol_b)
-        e2_input = self._interaction_features(expert2[drug_a], expert2[drug_b], mol_a, mol_b)
-        e3_input = self._interaction_features(expert3[drug_a], expert3[drug_b], mol_a, mol_b)
+        e1_input = self._expert_features(expert1[drug_a], expert1[drug_b], mol_a, mol_b)
+        e2_input = self._expert_features(expert2[drug_a], expert2[drug_b], mol_a, mol_b)
+        e3_input = self._expert_features(expert3[drug_a], expert3[drug_b], mol_a, mol_b)
 
         logits_e1 = self.logit_scale * self.classifier1(e1_input)
         logits_e2 = self.logit_scale * self.classifier2(e2_input)
@@ -103,16 +110,18 @@ class TMoEDDI(nn.Module):
 
         gate_weights = None
         gate_input = None
+
         if stage == 1:
             fused_logits = (logits_e1 + logits_e2 + logits_e3) / 3.0
         else:
             if not hasattr(self, "gate_layer"):
                 raise RuntimeError("Gate layer is not initialized. Call init_gate_layer() before Stage 2.")
-            gate_input = self._interaction_features(x2[drug_a], x2[drug_b], mol_a, mol_b)
+            gate_input = self._gate_features(x2[drug_a], x2[drug_b], mol_a, mol_b)
             gate_weights = F.softmax(self.gate_layer(gate_input), dim=1)
             fused_logits = (
                 gate_weights[:, 0:1] * logits_e1
                 + gate_weights[:, 1:2] * logits_e2
                 + gate_weights[:, 2:3] * logits_e3
             )
+
         return fused_logits, logits_e1, logits_e2, logits_e3, gate_weights, gate_input
